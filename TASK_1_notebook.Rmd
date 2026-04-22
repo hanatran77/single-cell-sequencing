@@ -1,0 +1,611 @@
+---
+title: "Screening Task Notebook_TASK_1"
+author: "TRAN NHAT VAN NHU"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+```{r}
+# Code from Task_1.R
+# Load libraries 
+library(Seurat)
+library(SeuratObject)
+library(hdf5r)
+library(ggplot2)
+library(viridis)
+library(png)
+library(grid)
+library(glmGamPoi)
+library(RColorBrewer)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggpubr)
+traceback()
+
+#----------------------------------------------
+# Step 1: Define base directory and sample IDs
+#----------------------------------------------
+base_dir <- "C:/Users/ADMIN/Desktop/GSE245620_RAW"
+sample_ids <- c("PSC011_A1","PSC011_B1","PSC011_C1","PSC011_D1")
+```
+
+
+
+```{r}
+#-------------------------------------------------
+# Step 2: Function to process counts + coordinates
+#-------------------------------------------------
+process_spatial <- function(base_dir, sample_id) {
+  sample_dir <- file.path(base_dir, sample_id)
+  
+  # 2.1 Read counts
+  counts <- Read10X(data.dir = sample_dir)
+  obj <- CreateSeuratObject(counts = counts, assay = "Spatial")
+  
+  # 2.2 Read spatial coordinates
+  coords <- read.csv(file.path(sample_dir, "spatial/tissue_positions.csv"), header = FALSE)
+  colnames(coords) <- c("barcode","in_tissue","array_row","array_col","pxl_row","pxl_col")
+  obj@meta.data <- cbind(obj@meta.data, coords[match(rownames(obj@meta.data), coords$barcode), ])
+  
+  return(obj)
+}
+
+# Run for all replicates
+PSC011_A1 <- process_spatial(base_dir, "PSC011_A1")
+PSC011_B1 <- process_spatial(base_dir, "PSC011_B1")
+PSC011_C1 <- process_spatial(base_dir, "PSC011_C1")
+PSC011_D1 <- process_spatial(base_dir, "PSC011_D1")
+
+PSC011_A1$sample <- "sample_A1"
+PSC011_B1$sample <- "sample_B1"
+PSC011_C1$sample <- "sample_C1"
+PSC011_D1$sample <- "sample_D1"
+
+```
+
+
+
+```{r}
+#--------------------------------------------
+# Step 3: Process integrated spatial datasets
+#--------------------------------------------
+PSC011_all <- merge(
+  PSC011_A1, 
+  y = list(PSC011_B1, PSC011_C1, PSC011_D1),
+  add.cell.ids = c("A1","B1","C1","D1"),
+  project = "PSC011")
+PSC011_all <- JoinLayers(PSC011_all)
+
+# Standard preprocessing
+PSC011_all[["percent.mt"]] <- PercentageFeatureSet(PSC011_all, pattern = "^MT-")   #mitochondrial percentage
+VlnPlot(PSC011_all,
+  features = c("nFeature_Spatial","nCount_Spatial","percent.mt"), ncol = 3)
+
+PSC011_all <- subset(
+  PSC011_all,
+  subset =
+    nFeature_Spatial > 500 &
+    nFeature_Spatial < 5000 &
+    percent.mt < 15)
+
+PSC011_all <- NormalizeData(PSC011_all)     #Normalization
+PSC011_all <- FindVariableFeatures(      # Find variable genes
+  PSC011_all,
+  selection.method = "vst",
+  nfeatures = 3000)                       # best choice for spatial transcriptomics 2000–3000 genes
+
+VariableFeaturePlot(PSC011_all)
+top20 <- head(VariableFeatures(PSC011_all), 20)
+LabelPoints(
+  plot = VariableFeaturePlot(PSC011_all),
+  points = top20,
+  repel = TRUE)
+
+# Spatial analysis pipeline
+options(future.globals.maxSize = 10 * 1024^3)  # EXTEND CAPACITY 10 GB
+PSC011_all <- ScaleData(PSC011_all)
+PSC011_all <- RunPCA(PSC011_all)
+ElbowPlot(PSC011_all) #dims = 1:20
+PSC011_all <- FindNeighbors(PSC011_all, dims = 1:20)
+PSC011_all <- FindClusters(PSC011_all, resolution = 0.5)
+PSC011_all <- RunUMAP(PSC011_all, dims = 1:20)
+
+DimPlot(PSC011_all, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+DimPlot(PSC011_all, group.by = "sample")
+
+# Load H&E image separately
+process_image <- function(base_dir, sample_id) {
+  sample_dir <- file.path(base_dir, sample_id)
+  img <- readPNG(file.path(sample_dir, "spatial/tissue_hires_image.png"))
+  g <- rasterGrob(img, width = unit(1,"npc"), height = unit(1,"npc"))
+  
+  return(g)
+}
+
+# Run image loading for all replicates
+PSC011_A1_img <- process_image(base_dir, "PSC011_A1")
+PSC011_B1_img <- process_image(base_dir, "PSC011_B1")
+PSC011_C1_img <- process_image(base_dir, "PSC011_C1")
+PSC011_D1_img <- process_image(base_dir, "PSC011_D1")
+```
+
+
+
+```{r}
+#----------------------------------------------
+# Step 4: Quality control on spatial spots
+#----------------------------------------------
+# total counts per spot
+ggplot(PSC011_all@meta.data, aes(x = pxl_col, y = pxl_row, color = nCount_Spatial)) +
+  geom_point(size = 3.0) +
+  scale_color_viridis_c() +
+  #scale_y_reverse() +
+  coord_fixed() +
+  theme_void() +
+  ggtitle("PSC Liver Tissue: Count per spot")
+
+# Number of features per spot
+ggplot(PSC011_all@meta.data, aes(x = pxl_col, y = pxl_row, color = nFeature_Spatial)) +
+  geom_point(size = 3.0) +
+  scale_color_viridis_c() +
+  #scale_y_reverse() +
+  coord_fixed() +
+  theme_void() +
+  ggtitle("PSC Liver Tissue: Feature per spot")
+
+ggplot(PSC011_all@meta.data, aes(x = nCount_Spatial)) +
+  geom_histogram(bins = 50, aes(fill = ..count..), color = "black") +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  ggtitle("Counts per spot")
+
+ggplot(PSC011_all@meta.data, aes(x = nFeature_Spatial)) +
+  geom_histogram(bins = 50, aes(fill = ..count..), color = "#080912") +
+  scale_fill_gradient(low = "#CDE5E9", high = "#4EA2B1") +
+  theme_light() +
+  ggtitle("Features per spot")
+
+ggplot(PSC011_all@meta.data, aes(x = pxl_col, y = pxl_row, color = factor(in_tissue))) +
+  geom_point(size = 3.0, alpha = 0.9) +
+  scale_color_manual(values = c("0" = "#7C825B", "1" = "#E0FF05")) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void() +
+  ggtitle("In Tissue vs Background Spots")
+
+ggplot(PSC011_A1@meta.data, aes(x = pxl_col, y = pxl_row, color = nFeature_Spatial)) + # REPLACE WITH nFeature_Spatial for feaures per spot
+  annotation_custom(PSC011_A1_img, #replace with PSC011_A1_img, PSC011_B1_img, PSC011_C1_img, and PSC011_D1_img, respectively
+                    xmin = 0,
+                    xmax = max(PSC011_all@meta.data$pxl_col),
+                    ymin = 0,
+                    ymax = max(PSC011_all@meta.data$pxl_row)) +
+  geom_point(size = 3.0, alpha = 0.9, shape = 16) +
+  scale_color_viridis_c() +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void() +
+  ggtitle("H&E imaging PSC tissue: Features per Spot: A1")
+
+# At this point, I have picked the one image that best match to PSC011_all, that is PSC011_A1_img
+# Therefore, I decide to Work on a single replicate because I only have one biological tissue, repeated 4 times
+# The replicates are technical repeats, not independent biological samples
+# Integration algorithms are designed to align independent biological samples
+# Rare cell populations (Kupffer, plasma cells, cholangiocytes) may be underrepresented in technical replicates
+
+```
+
+
+
+```{r}
+#-----------------------------------------------
+# Step 5: Visualize feature variables (PSC01_A1)
+#------------------------------------------------
+DefaultAssay(PSC011_A1) <- "Spatial"
+PSC011_A1 <- NormalizeData(PSC011_A1)                                                                                                             
+PSC011_A1 <- FindVariableFeatures(PSC011_A1)
+PSC011_A1 <- ScaleData(PSC011_A1)
+PSC011_A1 <- RunPCA(PSC011_A1)
+ElbowPlot(PSC011_A1)
+PSC011_A1 <- FindNeighbors(PSC011_A1, dims = 1:20)
+PSC011_A1 <- FindClusters(PSC011_A1, resolution = 0.5)
+PSC011_A1 <- RunUMAP(PSC011_A1, dims = 1:20)
+
+DimPlot(PSC011_A1, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+```
+
+
+```{r}
+markers_A1 <- FindAllMarkers(PSC011_A1)
+head(markers_A1)
+heatmap_data <- markers_A1 %>%
+  select(cluster, gene, avg_log2FC) %>%
+  pivot_wider(names_from = cluster, values_from = avg_log2FC)
+# Find 30 markers for all clusters
+heatmap_long <- heatmap_data %>%
+  pivot_longer(cols = -gene, names_to = "cluster", values_to = "avg_log2FC")
+top50 <- heatmap_long %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 50) %>%
+  ungroup()
+top50 <- top50 %>%
+  mutate(gene = str_replace(gene, "\\.\\d+$", ""))
+top50_genes <- unique(top50$gene)
+DoHeatmap(PSC011_A1, features = top50_genes) +
+  scale_fill_gradientn(colors = brewer.pal(n = 15, name = "YlGnBu")) +
+  theme(legend.position = "right")
+
+# At this point, we found out that there are 14,866 genes among total of 7 clusters (0 -> 6) within replicate PSC01_A1
+# Now, we need to find out cell types for each cluster in PSC011_A1.
+# This is a liver tissue with a disorder of Primary Sclerosing cholangitis, therefore average proportions may differ from the healthy adult liver tissue
+```
+
+
+
+```{r}
+#---------------------------
+# step 6: Assign cell types  
+#---------------------------
+rownames(PSC011_A1) <- str_replace(rownames(PSC011_A1), "\\.\\d+$", "")
+DotPlot(
+  PSC011_A1, 
+  group.by = "seurat_clusters",
+  features = c('ALB', 'TTR', 'APOA1', 'APOA2','FGB', 'FGG', 'CYP3A4', 'HAMP', "GLUL", "CPS1", "HAL", "ASS1", 
+               'KRT19', 'KRT7', 'EPCAM', 'SOX9', 'ANXA4', 'CLDN4',
+               'CD68', 'MARCO', 'VSIG4', 'CD163', 'CSF1R', 'C1QA',
+               'PECAM1', 'VWF', 'CD34', 'LYVE1', 'SELE', 'STAB1','CLEC4G',
+               'ACTA2', 'COL1A1', 'COL3A1', 'PDGFRB', 'VIM', 'DES',
+               'CD3D', 'CD3E', 'TRAC', 'CD4', 'CD8A', 'CD8B',
+               'MS4A1', 'CD79A', 'CD79B', 'IGKC','JCHAIN', 'IGHM', 'IGHG1'),
+  ) + RotatedAxis()
+
+FeaturePlot(PSC011_A1, features = c("CD68","MARCO","CD163","VSIG4","C1QA")) # Kufpffer cell
+FeaturePlot(PSC011_A1, features = c("JCHAIN","CD79A","CD79B","IGKC")) # Plasma markers
+
+# Annotate clusters with known liver cell types
+PSC011_A1$cell_types <- plyr::mapvalues(PSC011_A1$seurat_clusters,
+                                   from = c("0","1","2","3","4","5",'6'),
+                                   to   = c("Hepatocyte 1", 
+                                            "Hepatocyte 2",
+                                            "Plasma cells",
+                                            "Cholangiocytes",
+                                            "Stellate cells",
+                                            "Endothelial cells",
+                                            "Kupffer cells"))
+DimPlot(
+  PSC011_A1,
+  group.by = "cell_types",
+  label = TRUE,
+  repel = TRUE) + theme_classic()
+```
+
+
+
+```{r}
+#---------------------------
+# step 7: Spatial coordinates: checking scale factors_json.json  
+#---------------------------
+
+table(PSC011_A1@meta.data$in_tissue)
+
+# spot_diameter_fullres": 214.05155323534254, "tissue_hires_scalef": 0.0770416,
+#"fiducial_diameter_fullres": 345.7755859955533, "tissue_lowres_scalef": 0.023112481}
+# 214.05 × 0.0770416 ≈ ~16.5 PIXELS
+
+scale_factor <- 0.0770416 #tissue_hires_scalef 
+df1<- data.frame(
+  x = PSC011_A1@meta.data$pxl_col*scale_factor,
+  y = PSC011_A1@meta.data$pxl_row*scale_factor,
+  cell_type = PSC011_A1@meta.data$cell_types,
+  in_tissue = PSC011_A1@meta.data$in_tissue)
+
+df1<- df1[df1$in_tissue == 1, ]
+
+ggplot() +
+  annotation_raster(
+    PSC011_A1_img$raster,
+    xmin = min(df1$x),
+    xmax = max(df1$x),
+    ymin = min(df1$y),
+    ymax = max(df1$y)
+  ) +
+  geom_point(
+    data = df1,
+    aes(x = x, y = y, fill = cell_type),
+    shape = 21,
+    size = 3.0,
+    stroke = 0
+  ) +
+  scale_fill_brewer(palette = "Set2", name = "Cell types") +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void()
+
+# Spatial gene expression plot
+gene <- "IGKC"
+df_expr <- data.frame(
+  x = PSC011_A1@meta.data$pxl_col*scale_factor,
+  y = PSC011_A1@meta.data$pxl_row*scale_factor,
+  expression = FetchData(PSC011_A1, vars = gene)[,1],
+  in_tissue = PSC011_A1@meta.data$in_tissue
+)
+
+df_expr <- df_expr[df_expr$in_tissue == 1, ]
+
+ggplot() +
+  annotation_raster(
+    PSC011_A1_img$raster,
+    xmin = min(df_expr$x),
+    xmax = max(df_expr$x),
+    ymin = min(df_expr$y),
+    ymax = max(df_expr$y)
+  ) +
+  geom_point(
+    data = df_expr,
+    aes(x = x, y = y, color = expression),
+    size = 3.0
+  ) +
+  scale_color_gradientn(
+    colors = c("blue","green","yellow","red"),
+    name = gene
+  ) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void()
+```
+
+
+```{r}
+#---------------------------
+# step 8: Fibrosis Septa 
+#---------------------------
+
+fibrosis_genes <- c(
+  "ACTA2",   # myofibroblast marker recommended by GPT
+  "COL1A1",
+  "COL1A2",
+  "COL3A1",
+  "COL5A1",
+  "PDGFRB",
+  "TIMP1",
+  "MMP2",
+  "SPARC",
+  "TAGLN")
+
+cholangiocyte_genes <- c(
+  "KRT19",           ## cholangiocytes markers recommended by GPT
+  "KRT7",
+  "EPCAM",
+  "SOX9",
+  "MUC1")
+
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(fibrosis_genes),
+  name = "Fibrosis_Score")
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(cholangiocyte_genes),
+  name = "Cho_Score")
+PSC011_A1$portal_fibrosis_score <- PSC011_A1$Fibrosis_Score1 + PSC011_A1$Cho_Score1
+
+df_zone <- data.frame(
+  x = PSC011_A1$pxl_col * scale_factor,
+  y = PSC011_A1$pxl_row * scale_factor,
+  zonation = PSC011_A1$portal_fibrosis_score,
+  in_tissue = PSC011_A1$in_tissue
+)
+
+df_zone <- df_zone[df_zone$in_tissue == 1, ]
+
+ggplot() +
+  annotation_raster(
+    PSC011_A1_img$raster,
+    xmin=min(df_zone$x),
+    xmax=max(df_zone$x),
+    ymin=min(df_zone$y),
+    ymax=max(df_zone$y)
+  ) +
+  geom_point(
+    data=df_zone,
+    aes(x=x, y=y, color=zonation),
+    size=3.0
+  ) +
+  scale_color_gradient2(
+    low="blue",
+    mid="#800080",
+    high="#FFFF00",
+    midpoint=0,
+    name="Fibrosis Septa"
+  ) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void()
+
+df_plot <- data.frame(
+  cell_type = PSC011_A1@meta.data$cell_types,
+  zonation = PSC011_A1$portal_fibrosis_score)
+df_plot <- df_plot[PSC011_A1$in_tissue == 1, ]
+df_summary <- df_plot %>%
+  group_by(cell_type) %>%
+  summarise(mean_zonation = mean(zonation))
+ggplot(df_plot, aes(x = cell_type, y = zonation, fill = cell_type)) +
+  stat_summary(fun = mean, geom = "bar", color = "black") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(y = "Fibrosis Septa") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    legend.position = "none")
+```
+
+
+
+```{r}
+#---------------------------
+# step 9: Zonation Score: Portal vs Central Zonation
+#---------------------------
+
+central_genes <- c(
+  "GLUL",   # glutamine synthetase (classic CV marker)
+  "CYP2E1",
+  "CYP1A2",
+  "CYP3A4",
+  "LGR5",
+  "OAT")
+portal_genes <- c(
+  "CPS1",
+  "HAL",
+  "ASS1",
+  "ALB",
+  "HAMP",
+  "PCK1")
+
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(central_genes),
+  name = "CentralScore")
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(portal_genes),
+  name = "PortalScore")
+
+PSC011_A1$zonation_score  <-  PSC011_A1$CentralScore1 - PSC011_A1$PortalScore1
+
+df_zone1<- data.frame(
+  x = PSC011_A1$pxl_col * scale_factor,
+  y = PSC011_A1$pxl_row * scale_factor,
+  zonation = PSC011_A1$zonation_score,
+  in_tissue = PSC011_A1$in_tissue
+)
+
+df_zone1 <- df_zone1[df_zone1$in_tissue == 1, ]
+
+ggplot() +
+  annotation_raster(
+    PSC011_A1_img$raster,
+    xmin=min(df_zone1$x),
+    xmax=max(df_zone1$x),
+    ymin=min(df_zone1$y),
+    ymax=max(df_zone1$y)
+  ) +
+  geom_point(
+    data=df_zone1,
+    aes(x=x, y=y, color=zonation),
+    size=2.5
+  ) +
+  scale_color_gradient2(
+    low="blue",
+    mid="#FFFF00",
+    high="#800080",
+    midpoint=0,
+    name="Zonation score"
+  ) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void()
+
+df_plot1<- data.frame(
+  cell_type = PSC011_A1@meta.data$cell_types,
+  zonation = PSC011_A1$zonation_score)
+df_plot1 <- df_plot1[PSC011_A1$in_tissue == 1, ]
+df_summary1<- df_plot1%>%
+  group_by(cell_type) %>%
+  summarise(mean_zonation = mean(zonation))
+ggplot(df_plot1, aes(x = cell_type, y = zonation, fill = cell_type)) +
+  stat_summary(fun = mean, geom = "bar", color = "black") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(y = "Zonation score") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    legend.position = "none")
+hist(PSC011_A1$CentralScore1)
+hist(PSC011_A1$PortalScore1)
+```
+
+
+
+```{r}
+#--------------------------------------------------------
+# step 9: Tumor-stroma interfaces
+#--------------------------------------------------------
+
+tumor_genes <- c(
+  "EPCAM",
+  "KRT8",
+  "KRT18",
+  "KRT19",
+  "MUC1")
+stroma_genes <- c(
+  "COL1A1",
+  "COL3A1",
+  "ACTA2",
+  "SPARC",
+  "DCN",
+  "TAGLN")
+
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(tumor_genes),
+  name = "TumorScore")
+PSC011_A1 <- AddModuleScore(
+  PSC011_A1,
+  features = list(stroma_genes),
+  name = "StromaScore")
+PSC011_A1$interface_score <- 
+  PSC011_A1$TumorScore1 + PSC011_A1$StromaScore1
+
+df_interface <- data.frame(
+  x = PSC011_A1$pxl_col * scale_factor,
+  y = PSC011_A1$pxl_row * scale_factor,
+  interface = PSC011_A1$interface_score,
+  in_tissue = PSC011_A1$in_tissue)
+df_interface <- df_interface[df_interface$in_tissue == 1, ]
+
+ggplot() +
+  annotation_raster(
+    PSC011_A1_img$raster,
+    xmin=min(df_interface$x),
+    xmax=max(df_interface$x),
+    ymin=min(df_interface$y),
+    ymax=max(df_interface$y)
+  ) +
+  geom_point(
+    data=df_interface,
+    aes(x=x, y=y, color=interface),
+    size=3
+  ) +
+  scale_color_gradient2(
+    low="blue",
+    mid="purple",
+    high="yellow",
+    midpoint=0,
+    name="Tumor–Stroma Interface"
+  ) +
+  scale_y_reverse() +
+  coord_fixed() +
+  theme_void()
+
+df_plot2 <- data.frame(
+  cell_type = PSC011_A1@meta.data$cell_types,
+  interface = PSC011_A1$interface_score)
+
+ggplot(df_plot2, aes(x = cell_type, y = interface, fill = cell_type)) +
+  stat_summary(fun = mean, geom = "bar", color = "black") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(y = "Tumor–Stroma Interface") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    legend.position = "none")
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
